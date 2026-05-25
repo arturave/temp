@@ -159,7 +159,10 @@ def detect_flat_plate(body):
             continue
         n2 = face.geometry.normal
         dot = n1.dotProduct(n2)
-        if dot > -0.99:  # sciany nie sa antyrownolegle (gora vs dol)
+        # Plaszczyzny gora/dol musza byc rownolegle. Plane.normal zwraca normalna
+        # geometryczna plaszczyzny (nie zorientowana na zewnatrz), wiec moga byc
+        # rownolegle (dot ~ +1) albo antyrownolegle (dot ~ -1) - oba przypadki OK.
+        if abs(dot) < 0.999:
             continue
         o2 = face.geometry.origin
         gap = adsk.core.Vector3D.create(o2.x - o1.x, o2.y - o1.y, o2.z - o1.z)
