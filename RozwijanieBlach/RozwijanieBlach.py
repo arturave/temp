@@ -51,6 +51,12 @@ PLATE_AREA_MATCH_TOL = 0.10
 # nieudokumentowany - przy problemach ustaw na False (skrypt wypisze wtedy liste
 # elementow do recznej konwersji).
 ATTEMPT_AUTO_CONVERT = True
+# Wewnetrzne ID polecenia "Convert to Sheet Metal". To najlepsza znana nazwa, ale
+# moze sie roznic miedzy wersjami Fusion. Aby sprawdzic faktyczne ID na swoim
+# komputerze: w palecie Text Commands wpisz  TextCommands.List /hidden  i poszukaj
+# pozycji z "SheetMetal"/"Convert", albo zaloguj args.commandId w zdarzeniu
+# ui.commandStarting podczas recznego klikniecia przycisku.
+CONVERT_CMD_ID = 'ConvertToSheetMetalCmd'
 
 
 # ----------------------------------------------------------------------------
@@ -334,12 +340,24 @@ def try_convert_to_sheet_metal(app, ui, comp, body, logger):
     try:
         ui.activeSelections.clear()
         ui.activeSelections.add(face)
-        app.executeTextCommand(u'Commands.Start ConvertToSheetMetalCmd')
+        app.executeTextCommand(u'Commands.Start ' + CONVERT_CMD_ID)
+        # Poczekaj, az wejscia polecenia beda poprawne do zatwierdzenia.
+        try:
+            app.executeTextCommand(u'FusionDoc.WaitInputsValidForCommit')
+        except Exception:
+            pass
         app.executeTextCommand(u'NuCommands.CommitCmd')
     except Exception as e:
-        logger.log('[INFO] {}: proba auto-konwersji nie powiodla sie ({}).'.format(comp.name, e))
-        return False
+        logger.log('[INFO] {}: wyjatek przy auto-konwersji ({}).'.format(comp.name, e))
     finally:
+        # Zamknij ewentualnie otwarte okno polecenia, aby nie kolidowalo z kolejna
+        # iteracja petli (execute jest nieblokujace - niezatwierdzony dialog
+        # zostalby otwarty). Wyczysc tez zaznaczenie.
+        try:
+            if ui.activeCommand and ui.activeCommand != 'SelectCommand':
+                app.executeTextCommand(u'NuCommands.CancelCmd')
+        except Exception:
+            pass
         try:
             ui.activeSelections.clear()
         except Exception:
