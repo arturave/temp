@@ -236,19 +236,22 @@ def looks_like_sheet_candidate(body):
 def gather_unique_components(root_comp, logger):
     """
     Grupuje wszystkie wystapienia w calym zlozeniu po komponencie.
-    Zwraca slownik: nazwa -> {'comp': Component, 'count': int}.
+    Zwraca slownik: nazwa -> {'comp': Component, 'count': int, 'occ': Occurrence}.
+    'occ' to reprezentatywne wystapienie - potrzebne do zaznaczania scian w
+    kontekscie zlozenia (proxy).
     """
     result = {}
     occurrences = root_comp.allOccurrences
     for i in range(occurrences.count):
-        comp = occurrences.item(i).component
+        occ = occurrences.item(i)
+        comp = occ.component
         key = comp.name
         if key not in result:
-            result[key] = {'comp': comp, 'count': 0}
+            result[key] = {'comp': comp, 'count': 0, 'occ': occ}
         result[key]['count'] += 1
 
     if not result and root_comp.bRepBodies.count > 0:
-        result[root_comp.name] = {'comp': root_comp, 'count': 1}
+        result[root_comp.name] = {'comp': root_comp, 'count': 1, 'occ': None}
 
     logger.log('Wystapien lacznie: {}, niepowtarzalnych komponentow: {}'.format(
         occurrences.count, len(result)))
@@ -464,6 +467,7 @@ class Wizard(object):
             item = self.queue[self.idx]
             comp = item['comp']
             count = item['count']
+            occ = item.get('occ')
             self.logger.log('--- Komponent: {} (wystapien: {}) ---'.format(comp.name, count))
 
             body = largest_solid_body(comp)
@@ -486,7 +490,7 @@ class Wizard(object):
 
             cand_mm = looks_like_sheet_candidate(body)
             if cand_mm is not None:
-                if self._open_convert_dialog(comp, body, cand_mm):
+                if self._open_convert_dialog(comp, occ, body, cand_mm):
                     return  # czekamy na zamkniecie okna (commandTerminated)
                 self.idx += 1
                 continue
@@ -518,7 +522,7 @@ class Wizard(object):
             self.n_skip += 1
 
     # -- akcje na detalu -----------------------------------------------------
-    def _open_convert_dialog(self, comp, body, cand_mm):
+    def _open_convert_dialog(self, comp, occ, body, cand_mm):
         """Zaznacza sciane i otwiera okno 'Convert to Sheet Metal'. Zwraca True,
         jesli okno otwarto (czekamy na jego zamkniecie)."""
         face = largest_planar_face(body)
@@ -536,9 +540,18 @@ class Wizard(object):
             self.n_fail += 1
             return False
 
+        # Sciana z definicji komponentu nie jest zaznaczalna w aktywnym zlozeniu -
+        # potrzebny jest jej odpowiednik (proxy) w kontekscie wystapienia.
+        sel_face = face
+        if occ is not None:
+            try:
+                sel_face = face.createForAssemblyContext(occ)
+            except Exception:
+                sel_face = face
+
         try:
             self.ui.activeSelections.clear()
-            self.ui.activeSelections.add(face)
+            self.ui.activeSelections.add(sel_face)
         except Exception as e:
             self.logger.log('[BLAD] {}: nie udalo sie zaznaczyc sciany ({}).'.format(comp.name, e))
             self.n_fail += 1
