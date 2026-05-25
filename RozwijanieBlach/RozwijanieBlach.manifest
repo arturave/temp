@@ -1,0 +1,12 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "",
+    "description": {
+        "": "Automatyczne rozwijanie blach ze zlozenia i eksport DXF wg maski NazwaKomponentu_#X,Xmm_ZZZszt.dxf"
+    },
+    "version": "1.0.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
