@@ -46,6 +46,11 @@ import datetime
 PLATE_THICKNESS_RATIO_MAX = 0.2
 # Tolerancja zgodnosci pol gornej i dolnej sciany plyty (10%).
 PLATE_AREA_MATCH_TOL = 0.10
+# Czy probowac automatycznej konwersji bryl gietych na blache poleceniem Fusion
+# "Convert to Sheet Metal" (sterowanym przez executeTextCommand). Mechanizm jest
+# nieudokumentowany - przy problemach ustaw na False (skrypt wypisze wtedy liste
+# elementow do recznej konwersji).
+ATTEMPT_AUTO_CONVERT = True
 
 
 # ----------------------------------------------------------------------------
@@ -127,49 +132,99 @@ def body_is_sheet_metal(body):
         return False
 
 
+def _parallel_face_gap(f1, face):
+    """Odleglosc miedzy plaszczyznami dwoch rownoleglych scian (cm) albo None."""
+    if not isinstance(face.geometry, adsk.core.Plane):
+        return None
+    n1 = f1.geometry.normal
+    if abs(n1.dotProduct(face.geometry.normal)) < 0.999:
+        return None  # nie sa rownolegle
+    o1 = f1.geometry.origin
+    o2 = face.geometry.origin
+    v = adsk.core.Vector3D.create(o2.x - o1.x, o2.y - o1.y, o2.z - o1.z)
+    gap = abs(v.dotProduct(n1))
+    return gap if gap > 1e-4 else None
+
+
+def probe_wall_thickness_cm(body):
+    """
+    Szacowana grubosc materialu (cm): najmniejsza odleglosc miedzy najwieksza
+    plaska sciana a rownolegla do niej scianą po drugiej stronie sciany.
+    Dziala takze dla elementow gietych (mierzy grubosc scianki). None gdy brak.
+    """
+    f1 = largest_planar_face(body)
+    if f1 is None:
+        return None
+    best = None
+    for face in body.faces:
+        if face is f1:
+            continue
+        gap = _parallel_face_gap(f1, face)
+        if gap is not None and (best is None or gap < best):
+            best = gap
+    return best
+
+
 def detect_flat_plate(body):
     """
-    Sprawdza, czy bryla jest plaska plyta o jednolitej grubosci.
-    Zwraca (sciana_bazowa, grubosc_cm) albo None.
+    Sprawdza, czy bryla jest CZYSTA plaska plyta (prosty graniastoslup), ktora
+    mozna wyeksportowac bez rozwijania. Zwraca (sciana_bazowa, grubosc_cm) albo None.
 
-    Kryteria: istnieja dwie rownolegle plaskie sciany o zblizonym polu (gora/dol),
-    odlegle o grubosc = objetosc / pole sciany, przy czym grubosc jest mala
-    wzgledem rozmiaru obrysu (odrzuca walki, kostki, profile).
+    Kryteria:
+      - istnieja dwie rownolegle plaskie sciany o zblizonym polu (gora/dol),
+      - grubosc = odleglosc miedzy nimi (gap), mala wzgledem rozmiaru obrysu,
+      - objetosc ~= pole_sciany * gap  => bryla jest prosta plyta (bez flansz,
+        giec ani lokalnych pogrubien). To odrzuca elementy giete, ktore inaczej
+        daly by zawyzona grubosc i niepelny obrys.
     """
     f1 = largest_planar_face(body)
     if f1 is None or f1.area <= 0:
         return None
-
-    thickness_cm = body.volume / f1.area
-    extent_cm = f1.area ** 0.5
+    a1 = f1.area
+    extent_cm = a1 ** 0.5
     if extent_cm <= 0:
         return None
-    if thickness_cm / extent_cm > PLATE_THICKNESS_RATIO_MAX:
-        return None  # zbyt "gruba" wzgledem obrysu - to nie plyta
 
-    n1 = f1.geometry.normal
-    o1 = f1.geometry.origin
-
+    best_gap = None
     for face in body.faces:
         if face is f1:
             continue
-        if not isinstance(face.geometry, adsk.core.Plane):
+        if abs(face.area - a1) > PLATE_AREA_MATCH_TOL * a1:
             continue
-        if abs(face.area - f1.area) > PLATE_AREA_MATCH_TOL * f1.area:
-            continue
-        n2 = face.geometry.normal
-        dot = n1.dotProduct(n2)
-        # Plaszczyzny gora/dol musza byc rownolegle. Plane.normal zwraca normalna
-        # geometryczna plaszczyzny (nie zorientowana na zewnatrz), wiec moga byc
-        # rownolegle (dot ~ +1) albo antyrownolegle (dot ~ -1) - oba przypadki OK.
-        if abs(dot) < 0.999:
-            continue
-        o2 = face.geometry.origin
-        gap = adsk.core.Vector3D.create(o2.x - o1.x, o2.y - o1.y, o2.z - o1.z)
-        dist = abs(gap.dotProduct(n1))
-        if abs(dist - thickness_cm) <= max(0.005, 0.15 * thickness_cm):
-            return f1, thickness_cm
-    return None
+        gap = _parallel_face_gap(f1, face)
+        if gap is not None and (best_gap is None or gap < best_gap):
+            best_gap = gap
+    if best_gap is None:
+        return None
+
+    if best_gap / extent_cm > PLATE_THICKNESS_RATIO_MAX:
+        return None  # zbyt gruba wzgledem obrysu - to nie plyta
+
+    # Weryfikacja "czystej plyty": objetosc zgodna z prostym wyciagnieciem.
+    ratio = body.volume / (a1 * best_gap)
+    if ratio < 0.90 or ratio > 1.03:
+        return None  # flansze/giecia/pogrubienia - wymaga prawdziwego rozwiniecia
+
+    return f1, best_gap
+
+
+def looks_like_sheet_candidate(body):
+    """
+    Czy bryla wyglada na element blaszany o jednolitej grubosci, ktory dalo by
+    sie rozwinac PO konwersji 'Convert to Sheet Metal'. Zwraca grubosc_mm albo None.
+    """
+    t_cm = probe_wall_thickness_cm(body)
+    if t_cm is None:
+        return None
+    t_mm = t_cm * 10.0
+    if t_mm < 0.3 or t_mm > 8.0:
+        return None  # poza typowym zakresem blachy
+    f1 = largest_planar_face(body)
+    if f1 is None or f1.area <= 0:
+        return None
+    if t_cm / (f1.area ** 0.5) > PLATE_THICKNESS_RATIO_MAX:
+        return None  # zbyt masywna wzgledem obrysu (walek, kostka, profil lity)
+    return round(t_mm, 1)
 
 
 # ----------------------------------------------------------------------------
@@ -250,6 +305,10 @@ def export_flat_pattern_dxf(design, comp, body, count, out_folder, logger):
     filepath = os.path.join(out_folder, filename)
 
     opts = design.exportManager.createDXFFlatPatternExportOptions(filepath, flat)
+    try:
+        opts.isSplineConvertedToPolyline = True  # lepsze dla wycinarek laserowych
+    except Exception:
+        pass
     ok = design.exportManager.execute(opts)
     if ok:
         logger.log('[DXF] {}: zapisano "{}" (blacha gieta, grubosc {} mm, {} szt.)'.format(
@@ -260,10 +319,42 @@ def export_flat_pattern_dxf(design, comp, body, count, out_folder, logger):
 
 
 # ----------------------------------------------------------------------------
+# Automatyczna konwersja na blache (polecenie "Convert to Sheet Metal")
+# ----------------------------------------------------------------------------
+def try_convert_to_sheet_metal(app, ui, comp, body, logger):
+    """
+    Proba automatycznej konwersji bryly na konstrukcje blachowa przez wbudowane
+    polecenie Fusion 'ConvertToSheetMetalCmd' sterowane text commands. Polecenie
+    samo wykrywa grubosc i stosuje aktywna regule blachowa (jak w oknie dialogowym).
+    Zwraca True, jesli bryla stala sie blacha.
+    """
+    face = largest_planar_face(body)
+    if face is None:
+        return False
+    try:
+        ui.activeSelections.clear()
+        ui.activeSelections.add(face)
+        app.executeTextCommand(u'Commands.Start ConvertToSheetMetalCmd')
+        app.executeTextCommand(u'NuCommands.CommitCmd')
+    except Exception as e:
+        logger.log('[INFO] {}: proba auto-konwersji nie powiodla sie ({}).'.format(comp.name, e))
+        return False
+    finally:
+        try:
+            ui.activeSelections.clear()
+        except Exception:
+            pass
+
+    # Po konwersji bryla moze byc nowym obiektem - pobierz ja na swiezo.
+    new_body = largest_solid_body(comp)
+    return new_body is not None and body_is_sheet_metal(new_body)
+
+
+# ----------------------------------------------------------------------------
 # Przetwarzanie pojedynczego komponentu
 # ----------------------------------------------------------------------------
-def process_component(comp, count, out_folder, design, logger):
-    """Zwraca 'ok' | 'skip' | 'fail'."""
+def process_component(app, ui, comp, count, out_folder, design, logger):
+    """Zwraca 'ok' | 'convert' | 'skip' | 'fail'."""
     name = comp.name
 
     if comp.bRepBodies.count == 0:
@@ -275,7 +366,7 @@ def process_component(comp, count, out_folder, design, logger):
         logger.log('[POMIN] {}: brak bryl typu solid.'.format(name))
         return 'skip'
 
-    # a) Blacha gieta zdefiniowana jako sheet metal.
+    # a) Blacha gieta zdefiniowana jako sheet metal -> rozwin i eksportuj.
     if body_is_sheet_metal(body):
         try:
             return export_flat_pattern_dxf(design, comp, body, count, out_folder, logger)
@@ -283,7 +374,7 @@ def process_component(comp, count, out_folder, design, logger):
             logger.log('[BLAD] {}: rozwiniecie blachy gietej nieudane ({}).'.format(name, e))
             return 'fail'
 
-    # b) Plaska plyta o jednolitej grubosci - eksport obrysu bezposrednio.
+    # b) Czysta plaska plyta o jednolitej grubosci -> eksport obrysu bezposrednio.
     plate = detect_flat_plate(body)
     if plate is not None:
         face, thickness_cm = plate
@@ -302,10 +393,31 @@ def process_component(comp, count, out_folder, design, logger):
         logger.log('[BLAD] {}: saveAsDXF zwrocilo False.'.format(name))
         return 'fail'
 
-    # c) Element nie jest ani blacha, ani plaska plyta.
-    logger.log('[POMIN] {}: nie jest blacha ani plaska plyta. Pominieto '
-               '(np. profil, tuleja, walek, odlew lub element giety wymagajacy '
-               'recznej konwersji "Convert to Sheet Metal").'.format(name))
+    # c) Element gięty o jednolitej grubosci -> kandydat do konwersji na blache.
+    cand_mm = looks_like_sheet_candidate(body)
+    if cand_mm is not None:
+        if ATTEMPT_AUTO_CONVERT:
+            logger.log('[KONWERSJA] {}: proba auto-konwersji na blache '
+                       '(wstepnie wykryta grubosc ~{} mm)...'.format(
+                           name, format_thickness_mm(cand_mm)))
+            if try_convert_to_sheet_metal(app, ui, comp, body, logger):
+                logger.log('[OK] {}: skonwertowano na blache.'.format(name))
+                try:
+                    return export_flat_pattern_dxf(
+                        design, comp, largest_solid_body(comp), count, out_folder, logger)
+                except Exception as e:
+                    logger.log('[BLAD] {}: rozwiniecie po konwersji nieudane ({}).'.format(name, e))
+                    return 'fail'
+            logger.log('[KONWERSJA] {}: auto-konwersja nieudana - wykonaj recznie '
+                       '"Convert to Sheet Metal" i uruchom skrypt ponownie.'.format(name))
+            return 'convert'
+        logger.log('[KONWERSJA] {}: kandydat na blache, wykryta grubosc ~{} mm. '
+                   'Wykonaj recznie "Convert to Sheet Metal" i uruchom skrypt ponownie.'.format(
+                       name, format_thickness_mm(cand_mm)))
+        return 'convert'
+
+    logger.log('[POMIN] {}: nie jest blacha ani plaska plyta '
+               '(np. walek, tuleja, odlew, zlaczka, element lity).'.format(name))
     return 'skip'
 
 
@@ -349,28 +461,44 @@ def run(context):
 
         components = gather_unique_components(root_comp, logger)
 
-        n_ok = n_skip = n_fail = 0
+        n_ok = n_skip = n_fail = n_conv = 0
+        convert_names = []
         for data in components.values():
             comp = data['comp']
             count = data['count']
             logger.log('--- Komponent: {} (wystapien: {}) ---'.format(comp.name, count))
-            result = process_component(comp, count, out_folder, design, logger)
+            result = process_component(app, ui, comp, count, out_folder, design, logger)
             if result == 'ok':
                 n_ok += 1
+            elif result == 'convert':
+                n_conv += 1
+                convert_names.append(comp.name)
             elif result == 'skip':
                 n_skip += 1
             else:
                 n_fail += 1
 
-        logger.log('=== KONIEC: zapisano {}, pominieto {}, bledy {} ==='.format(
-            n_ok, n_skip, n_fail))
+        if convert_names:
+            logger.log('--- Kandydaci do recznej konwersji na blache ({}): ---'.format(n_conv))
+            for nm in convert_names:
+                logger.log('    * {}'.format(nm))
 
-        ui.messageBox(
-            'Zakonczono.\n\n'
-            'Zapisane DXF: {}\n'
-            'Pominiete: {}\n'
-            'Bledy: {}\n\n'
-            'Log: {}'.format(n_ok, n_skip, n_fail, log_path))
+        logger.log('=== KONIEC: zapisano {}, do konwersji {}, pominieto {}, '
+                   'bledy {} ==='.format(n_ok, n_conv, n_skip, n_fail))
+
+        summary = ('Zakonczono.\n\n'
+                   'Zapisane DXF: {}\n'
+                   'Do recznej konwersji na blache: {}\n'
+                   'Pominiete: {}\n'
+                   'Bledy: {}\n\n'
+                   'Log: {}').format(n_ok, n_conv, n_skip, n_fail, log_path)
+        if convert_names:
+            preview = '\n'.join('  - ' + nm for nm in convert_names[:12])
+            if n_conv > 12:
+                preview += '\n  - ... (+{} wiecej, szczegoly w logu)'.format(n_conv - 12)
+            summary += ('\n\nElementy do konwersji "Convert to Sheet Metal" '
+                        '(potem uruchom skrypt ponownie):\n' + preview)
+        ui.messageBox(summary)
 
     except Exception:
         msg = 'Blad wykonania skryptu:\n{}'.format(traceback.format_exc())
