@@ -1,0 +1,12 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "",
+    "description": {
+        "": "Wykrywa wewnetrzne ID polecenia (np. Konwertuj na konstrukcje blachowa) do ustawienia CONVERT_CMD_ID"
+    },
+    "version": "1.0.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

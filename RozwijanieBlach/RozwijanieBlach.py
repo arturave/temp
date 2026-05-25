@@ -347,6 +347,36 @@ NEXT_EVENT_ID = 'rozwijanie_blach_next_part'
 # Referencje globalne, aby kreator i handlery nie zostaly usuniete po run().
 _wizard = None
 _handlers = []
+_candidates_logged = False
+
+
+def log_command_id_candidates(ui, logger):
+    """Wypisuje do logu ID polecen, ktore moga byc komenda konwersji na blache
+    (zawieraja w ID 'sheet'/'convert'/'flat'). Pomaga ustawic CONVERT_CMD_ID."""
+    global _candidates_logged
+    if _candidates_logged:
+        return
+    _candidates_logged = True
+    try:
+        defs = ui.commandDefinitions
+        found = []
+        for i in range(defs.count):
+            try:
+                cid = defs.item(i).id
+            except Exception:
+                continue
+            low = cid.lower()
+            if 'sheetmetal' in low or 'convert' in low or 'flatpattern' in low:
+                found.append(cid)
+        if found:
+            logger.log('Mozliwe ID polecen do CONVERT_CMD_ID (zawieraja sheetmetal/convert/flatpattern):')
+            for cid in sorted(set(found)):
+                logger.log('    ? ' + cid)
+        else:
+            logger.log('Nie znaleziono kandydatow ID w commandDefinitions. '
+                       'Uzyj skryptu pomocniczego WykryjIDPolecenia.')
+    except Exception as e:
+        logger.log('Skan commandDefinitions nieudany: {}'.format(e))
 
 
 class Wizard(object):
@@ -500,8 +530,9 @@ class Wizard(object):
         cmd_def = self.ui.commandDefinitions.itemById(CONVERT_CMD_ID)
         if cmd_def is None:
             self.logger.log('[BLAD] Nie znaleziono polecenia "{}". Ustaw poprawne '
-                            'CONVERT_CMD_ID (patrz komentarz w skrypcie). Pomijam {}.'.format(
-                                CONVERT_CMD_ID, comp.name))
+                            'CONVERT_CMD_ID (patrz log ponizej / skrypt WykryjIDPolecenia). '
+                            'Pomijam {}.'.format(CONVERT_CMD_ID, comp.name))
+            log_command_id_candidates(self.ui, self.logger)
             self.n_fail += 1
             return False
 
