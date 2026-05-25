@@ -7,29 +7,31 @@ Dziala na aktywnym projekcie (Design). Skrypt:
      "Text Commands" Fusion (Widok > Show Text Commands).
   2. Analizuje drzewo zlozenia i identyfikuje niepowtarzalne komponenty oraz
      liczbe ich wystapien (laczna ilosc sztuk w calym zlozeniu).
-  3. Dla kazdego komponentu wyznacza ksztalt do wyciecia, na jeden z dwoch sposobow:
+  3. Przetwarza detale sekwencyjnie (kreator pol-automatyczny), na jeden z trzech
+     sposobow:
        a) BLACHA GIETA - gdy bryla jest juz konstrukcja blachowa
           (BRepBody.isSheetMetal == True). Tworzony jest wzor plaski
-          (createFlatPattern) wg regul rozwijania (Sheet Metal Rules) projektu.
-       b) PLASKA PLYTA - gdy bryla jest plaska plyta o jednolitej grubosci
-          (np. element ciety laserem/plazma, niezdefiniowany jako blacha).
-          Eksportowany jest bezposrednio obrys najwiekszej sciany - rozwijanie
-          nie jest potrzebne, bo element jest juz plaski.
-     Pozostale elementy (tuleje, profile, walki, odlewy, elementy giete
-     niezdefiniowane jako blacha) sa pomijane i odnotowane w logu.
+          (createFlatPattern) wg regul rozwijania (Sheet Metal Rules) i od razu
+          zapisywany DXF - bez pytania uzytkownika.
+       b) PLASKA PLYTA - czysta plyta o jednolitej grubosci (graniastoslup).
+          Eksportowany jest obrys najwiekszej sciany - bez konwersji.
+       c) ELEMENT GIETY (kandydat na blache) - skrypt zaznacza sciane i OTWIERA
+          okno "Convert to Sheet Metal" (Fusion sam wykrywa grubosc). Uzytkownik
+          klika OK lub Anuluj:
+            * OK     -> tworzony wzor plaski i zapisywany DXF,
+            * Anuluj -> detal pomijany, przechodzimy do nastepnego.
+     Pozostale elementy (tuleje, walki, odlewy, zlaczki) sa pomijane.
   4. Eksportuje ksztalt do DXF do wskazanego folderu, nadajac nazwe wg maski:
         NazwaKomponentu_#X,Xmm_ZZZszt.dxf
      (grubosc z przecinkiem dziesietnym, ilosc uzupelniona do 3 cyfr, np. 005szt).
+     DXF wzoru plaskiego zawiera tylko linie srodkowe giecia (bez linii zakresu),
+     a splajny sa zamieniane na polilinie (pod wycinarki laserowe).
 
-Grubosc jest odczytywana z geometrii (objetosc / pole najwiekszej sciany).
+Grubosc blachy gietej i plyty jest odczytywana z geometrii, a dla elementow
+konwertowanych - wykrywana przez samo polecenie Fusion "Convert to Sheet Metal".
 
-OGRANICZENIE API FUSION: nie istnieje programowa komenda "Convert to Sheet Metal".
-Bryly giete, ktore nie sa zdefiniowane jako blacha, trzeba przekonwertowac recznie
-(Sheet Metal > Convert to Sheet Metal) i uruchomic skrypt ponownie. Skrypt
-wypisuje liste takich elementow w logu.
-
-UWAGA: Tworzenie wzorow plaskich wymaga trybu parametrycznego (Design History
-wlaczona). W trybie bezposrednim (Direct) funkcja nie jest dostepna.
+UWAGA: Tworzenie wzorow plaskich i konwersja wymagaja trybu parametrycznego
+(Design History wlaczona) oraz EDYTOWALNEGO dokumentu (nie "tylko do odczytu").
 """
 
 import adsk.core
@@ -46,11 +48,6 @@ import datetime
 PLATE_THICKNESS_RATIO_MAX = 0.2
 # Tolerancja zgodnosci pol gornej i dolnej sciany plyty (10%).
 PLATE_AREA_MATCH_TOL = 0.10
-# Czy probowac automatycznej konwersji bryl gietych na blache poleceniem Fusion
-# "Convert to Sheet Metal" (sterowanym przez executeTextCommand). Mechanizm jest
-# nieudokumentowany - przy problemach ustaw na False (skrypt wypisze wtedy liste
-# elementow do recznej konwersji).
-ATTEMPT_AUTO_CONVERT = True
 # Wewnetrzne ID polecenia "Convert to Sheet Metal". To najlepsza znana nazwa, ale
 # moze sie roznic miedzy wersjami Fusion. Aby sprawdzic faktyczne ID na swoim
 # komputerze: w palecie Text Commands wpisz  TextCommands.List /hidden  i poszukaj
@@ -311,8 +308,17 @@ def export_flat_pattern_dxf(design, comp, body, count, out_folder, logger):
     filepath = os.path.join(out_folder, filename)
 
     opts = design.exportManager.createDXFFlatPatternExportOptions(filepath, flat)
+    # Tylko linie srodkowe giecia; bez linii zakresu giecia. Splajny -> polilinie.
     try:
-        opts.isSplineConvertedToPolyline = True  # lepsze dla wycinarek laserowych
+        opts.isCenterLinesExported = True
+    except Exception:
+        pass
+    try:
+        opts.isExtentLinesExported = False
+    except Exception:
+        pass
+    try:
+        opts.isSplineConvertedToPolyline = True
     except Exception:
         pass
     ok = design.exportManager.execute(opts)
@@ -325,124 +331,312 @@ def export_flat_pattern_dxf(design, comp, body, count, out_folder, logger):
 
 
 # ----------------------------------------------------------------------------
-# Automatyczna konwersja na blache (polecenie "Convert to Sheet Metal")
+# Pol-automatyczny kreator (wizard) - sekwencyjne przetwarzanie detali
 # ----------------------------------------------------------------------------
-def try_convert_to_sheet_metal(app, ui, comp, body, logger):
-    """
-    Proba automatycznej konwersji bryly na konstrukcje blachowa przez wbudowane
-    polecenie Fusion 'ConvertToSheetMetalCmd' sterowane text commands. Polecenie
-    samo wykrywa grubosc i stosuje aktywna regule blachowa (jak w oknie dialogowym).
-    Zwraca True, jesli bryla stala sie blacha.
-    """
-    face = largest_planar_face(body)
-    if face is None:
-        return False
-    try:
-        ui.activeSelections.clear()
-        ui.activeSelections.add(face)
-        app.executeTextCommand(u'Commands.Start ' + CONVERT_CMD_ID)
-        # Poczekaj, az wejscia polecenia beda poprawne do zatwierdzenia.
+# Fusion nie pozwala czekac synchronicznie na zamkniecie okna dialogowego, a
+# CommandDefinition.execute() jest nieblokujace. Dlatego detale przetwarzamy jako
+# maszyne stanow sterowana zdarzeniami:
+#   - dla detalu wymagajacego konwersji otwieramy okno "Convert to Sheet Metal"
+#     (uzytkownik klika OK lub Anuluj),
+#   - zdarzenie commandTerminated mowi, czy zatwierdzono (OK) czy anulowano,
+#   - po OK tworzymy wzor plaski i zapisujemy DXF, po Anuluj pomijamy detal,
+#   - kolejny detal uruchamiamy przez wlasne zdarzenie (custom event), aby nie
+#     wywolywac polecenia z wnetrza obslugi zdarzenia (re-entrancy).
+NEXT_EVENT_ID = 'rozwijanie_blach_next_part'
+
+# Referencje globalne, aby kreator i handlery nie zostaly usuniete po run().
+_wizard = None
+_handlers = []
+
+
+class Wizard(object):
+    def __init__(self, app, ui, design, out_folder, logger, queue, log_path):
+        self.app = app
+        self.ui = ui
+        self.design = design
+        self.out_folder = out_folder
+        self.logger = logger
+        self.queue = queue
+        self.log_path = log_path
+        self.idx = 0
+        self.pending = None          # wynik ostatniego okna konwersji do rozliczenia
+        self.waiting = False         # czy czekamy na zamkniecie okna konwersji
+        self.waiting_comp = None
+        self.n_ok = 0
+        self.n_skip = 0
+        self.n_fail = 0
+        self.n_cancel = 0
+        self.cancelled = []
+        self.next_event = None
+        self._finished = False
+
+    # -- start / koniec ------------------------------------------------------
+    def start(self):
         try:
-            app.executeTextCommand(u'FusionDoc.WaitInputsValidForCommit')
+            self.app.unregisterCustomEvent(NEXT_EVENT_ID)
         except Exception:
             pass
-        app.executeTextCommand(u'NuCommands.CommitCmd')
-    except Exception as e:
-        logger.log('[INFO] {}: wyjatek przy auto-konwersji ({}).'.format(comp.name, e))
-    finally:
-        # Zamknij ewentualnie otwarte okno polecenia, aby nie kolidowalo z kolejna
-        # iteracja petli (execute jest nieblokujace - niezatwierdzony dialog
-        # zostalby otwarty). Wyczysc tez zaznaczenie.
+        self.next_event = self.app.registerCustomEvent(NEXT_EVENT_ID)
+        next_handler = _NextPartHandler(self)
+        self.next_event.add(next_handler)
+        _handlers.append(next_handler)
+
+        term_handler = _CommandTerminatedHandler(self)
+        self.ui.commandTerminated.add(term_handler)
+        _handlers.append(term_handler)
+        self.term_handler = term_handler
+
+        adsk.autoTerminate(False)
+        self.pump()
+
+    def finish(self):
+        if self._finished:
+            return
+        self._finished = True
+        self.logger.log('=== KONIEC: zapisano {}, anulowano {}, pominieto {}, '
+                        'bledy {} ==='.format(self.n_ok, self.n_cancel, self.n_skip, self.n_fail))
+
         try:
-            if ui.activeCommand and ui.activeCommand != 'SelectCommand':
-                app.executeTextCommand(u'NuCommands.CancelCmd')
+            self.ui.commandTerminated.remove(self.term_handler)
         except Exception:
             pass
         try:
-            ui.activeSelections.clear()
+            self.app.unregisterCustomEvent(NEXT_EVENT_ID)
         except Exception:
             pass
 
-    # Po konwersji bryla moze byc nowym obiektem - pobierz ja na swiezo.
-    new_body = largest_solid_body(comp)
-    return new_body is not None and body_is_sheet_metal(new_body)
-
-
-# ----------------------------------------------------------------------------
-# Przetwarzanie pojedynczego komponentu
-# ----------------------------------------------------------------------------
-def process_component(app, ui, comp, count, out_folder, design, logger):
-    """Zwraca 'ok' | 'convert' | 'skip' | 'fail'."""
-    name = comp.name
-
-    if comp.bRepBodies.count == 0:
-        logger.log('[POMIN] {}: brak bryl (zlozenie posrednie / szkic).'.format(name))
-        return 'skip'
-
-    body = largest_solid_body(comp)
-    if body is None:
-        logger.log('[POMIN] {}: brak bryl typu solid.'.format(name))
-        return 'skip'
-
-    # a) Blacha gieta zdefiniowana jako sheet metal -> rozwin i eksportuj.
-    if body_is_sheet_metal(body):
+        summary = ('Zakonczono.\n\n'
+                   'Zapisane DXF: {}\n'
+                   'Anulowane (Anuluj w oknie): {}\n'
+                   'Pominiete (nie-blacha): {}\n'
+                   'Bledy: {}\n\n'
+                   'Log: {}').format(self.n_ok, self.n_cancel, self.n_skip, self.n_fail, self.log_path)
+        if self.cancelled:
+            preview = '\n'.join('  - ' + nm for nm in self.cancelled[:15])
+            summary += '\n\nAnulowane detale:\n' + preview
         try:
-            return export_flat_pattern_dxf(design, comp, body, count, out_folder, logger)
+            self.ui.messageBox(summary)
+        except Exception:
+            pass
+        self.logger.close()
+        adsk.terminate()
+
+    # -- glowna petla --------------------------------------------------------
+    def pump(self):
+        """Rozlicza poprzednie okno konwersji i przetwarza kolejne detale az do
+        napotkania detalu wymagajacego okna dialogowego (wtedy czeka) lub konca."""
+        if self.pending is not None:
+            self._resolve_pending()
+            self.pending = None
+            self.idx += 1
+
+        while self.idx < len(self.queue):
+            item = self.queue[self.idx]
+            comp = item['comp']
+            count = item['count']
+            self.logger.log('--- Komponent: {} (wystapien: {}) ---'.format(comp.name, count))
+
+            body = largest_solid_body(comp)
+            if body is None:
+                self.logger.log('[POMIN] {}: brak bryl typu solid.'.format(comp.name))
+                self.n_skip += 1
+                self.idx += 1
+                continue
+
+            if body_is_sheet_metal(body):
+                self._unfold_and_export(comp, body, count)
+                self.idx += 1
+                continue
+
+            plate = detect_flat_plate(body)
+            if plate is not None:
+                self._export_plate(comp, plate, count)
+                self.idx += 1
+                continue
+
+            cand_mm = looks_like_sheet_candidate(body)
+            if cand_mm is not None:
+                if self._open_convert_dialog(comp, body, cand_mm):
+                    return  # czekamy na zamkniecie okna (commandTerminated)
+                self.idx += 1
+                continue
+
+            self.logger.log('[POMIN] {}: nie jest blacha ani plaska plyta '
+                            '(np. walek, tuleja, odlew, zlaczka, element lity).'.format(comp.name))
+            self.n_skip += 1
+            self.idx += 1
+
+        self.finish()
+
+    def _resolve_pending(self):
+        kind = self.pending[0]
+        comp = self.pending[1]
+        if kind == 'export':
+            count = self.pending[2]
+            body = largest_solid_body(comp)
+            if body is not None:
+                self._unfold_and_export(comp, body, count)
+            else:
+                self.logger.log('[BLAD] {}: brak bryly po konwersji.'.format(comp.name))
+                self.n_fail += 1
+        elif kind == 'cancel':
+            self.logger.log('[ANULOWANO] {}: wcisnieto Anuluj - pomijam kolejne kroki.'.format(comp.name))
+            self.n_cancel += 1
+            self.cancelled.append(comp.name)
+        else:  # 'noconv'
+            self.logger.log('[POMIN] {}: po zamknieciu okna bryla nie jest blacha.'.format(comp.name))
+            self.n_skip += 1
+
+    # -- akcje na detalu -----------------------------------------------------
+    def _open_convert_dialog(self, comp, body, cand_mm):
+        """Zaznacza sciane i otwiera okno 'Convert to Sheet Metal'. Zwraca True,
+        jesli okno otwarto (czekamy na jego zamkniecie)."""
+        face = largest_planar_face(body)
+        if face is None:
+            self.logger.log('[POMIN] {}: brak plaskiej sciany bazowej.'.format(comp.name))
+            self.n_skip += 1
+            return False
+
+        cmd_def = self.ui.commandDefinitions.itemById(CONVERT_CMD_ID)
+        if cmd_def is None:
+            self.logger.log('[BLAD] Nie znaleziono polecenia "{}". Ustaw poprawne '
+                            'CONVERT_CMD_ID (patrz komentarz w skrypcie). Pomijam {}.'.format(
+                                CONVERT_CMD_ID, comp.name))
+            self.n_fail += 1
+            return False
+
+        try:
+            self.ui.activeSelections.clear()
+            self.ui.activeSelections.add(face)
         except Exception as e:
-            logger.log('[BLAD] {}: rozwiniecie blachy gietej nieudane ({}).'.format(name, e))
-            return 'fail'
+            self.logger.log('[BLAD] {}: nie udalo sie zaznaczyc sciany ({}).'.format(comp.name, e))
+            self.n_fail += 1
+            return False
 
-    # b) Czysta plaska plyta o jednolitej grubosci -> eksport obrysu bezposrednio.
-    plate = detect_flat_plate(body)
-    if plate is not None:
+        self.waiting = True
+        self.waiting_comp = comp
+        self.logger.log('[KONWERSJA] {}: otwarto okno "Convert to Sheet Metal" '
+                        '(wstepnie ~{} mm). Zatwierdz (OK) albo Anuluj.'.format(
+                            comp.name, format_thickness_mm(cand_mm)))
+        try:
+            cmd_def.execute()
+        except Exception as e:
+            self.logger.log('[BLAD] {}: nie udalo sie otworzyc okna konwersji ({}).'.format(comp.name, e))
+            self.waiting = False
+            self.waiting_comp = None
+            self.n_fail += 1
+            return False
+        return True
+
+    def _unfold_and_export(self, comp, body, count):
+        try:
+            res = export_flat_pattern_dxf(self.design, comp, body, count, self.out_folder, self.logger)
+        except Exception as e:
+            self.logger.log('[BLAD] {}: rozwiniecie/eksport nieudane ({}).'.format(comp.name, e))
+            self.n_fail += 1
+            return
+        if res == 'ok':
+            self.n_ok += 1
+        elif res == 'fail':
+            self.n_fail += 1
+        else:
+            self.n_skip += 1
+
+    def _export_plate(self, comp, plate, count):
         face, thickness_cm = plate
         thickness_mm = round(thickness_cm * 10.0, 1)
-        filename = build_filename(name, thickness_mm, count)
-        filepath = os.path.join(out_folder, filename)
+        filename = build_filename(comp.name, thickness_mm, count)
+        filepath = os.path.join(self.out_folder, filename)
         try:
-            ok = export_face_as_dxf(comp, face, filepath, logger)
+            ok = export_face_as_dxf(comp, face, filepath, self.logger)
         except Exception as e:
-            logger.log('[BLAD] {}: eksport obrysu plyty nieudany ({}).'.format(name, e))
-            return 'fail'
+            self.logger.log('[BLAD] {}: eksport obrysu plyty nieudany ({}).'.format(comp.name, e))
+            self.n_fail += 1
+            return
         if ok:
-            logger.log('[DXF] {}: zapisano "{}" (plaska plyta, grubosc {} mm, {} szt.)'.format(
-                name, filename, format_thickness_mm(thickness_mm), count))
-            return 'ok'
-        logger.log('[BLAD] {}: saveAsDXF zwrocilo False.'.format(name))
-        return 'fail'
+            self.logger.log('[DXF] {}: zapisano "{}" (plaska plyta, grubosc {} mm, {} szt.)'.format(
+                comp.name, filename, format_thickness_mm(thickness_mm), count))
+            self.n_ok += 1
+        else:
+            self.logger.log('[BLAD] {}: saveAsDXF zwrocilo False.'.format(comp.name))
+            self.n_fail += 1
 
-    # c) Element gięty o jednolitej grubosci -> kandydat do konwersji na blache.
-    cand_mm = looks_like_sheet_candidate(body)
-    if cand_mm is not None:
-        if ATTEMPT_AUTO_CONVERT:
-            logger.log('[KONWERSJA] {}: proba auto-konwersji na blache '
-                       '(wstepnie wykryta grubosc ~{} mm)...'.format(
-                           name, format_thickness_mm(cand_mm)))
-            if try_convert_to_sheet_metal(app, ui, comp, body, logger):
-                logger.log('[OK] {}: skonwertowano na blache.'.format(name))
-                try:
-                    return export_flat_pattern_dxf(
-                        design, comp, largest_solid_body(comp), count, out_folder, logger)
-                except Exception as e:
-                    logger.log('[BLAD] {}: rozwiniecie po konwersji nieudane ({}).'.format(name, e))
-                    return 'fail'
-            logger.log('[KONWERSJA] {}: auto-konwersja nieudana - wykonaj recznie '
-                       '"Convert to Sheet Metal" i uruchom skrypt ponownie.'.format(name))
-            return 'convert'
-        logger.log('[KONWERSJA] {}: kandydat na blache, wykryta grubosc ~{} mm. '
-                   'Wykonaj recznie "Convert to Sheet Metal" i uruchom skrypt ponownie.'.format(
-                       name, format_thickness_mm(cand_mm)))
-        return 'convert'
+    # -- zdarzenia -----------------------------------------------------------
+    def on_command_terminated(self, args):
+        if not self.waiting:
+            return
+        try:
+            if args.commandId != CONVERT_CMD_ID:
+                return
+        except Exception:
+            return
 
-    logger.log('[POMIN] {}: nie jest blacha ani plaska plyta '
-               '(np. walek, tuleja, odlew, zlaczka, element lity).'.format(name))
-    return 'skip'
+        comp = self.waiting_comp
+        self.waiting = False
+        self.waiting_comp = None
+        try:
+            self.ui.activeSelections.clear()
+        except Exception:
+            pass
+
+        try:
+            completed = (args.terminationReason ==
+                         adsk.core.CommandTerminationReason.CompletedTerminationReason)
+        except Exception:
+            completed = False
+
+        body = largest_solid_body(comp)
+        count = self.queue[self.idx]['count']
+        if completed and body is not None and body_is_sheet_metal(body):
+            self.logger.log('[OK] {}: skonwertowano na blache (grubosc wykryta przez Fusion).'.format(comp.name))
+            self.pending = ('export', comp, count)
+        elif not completed:
+            self.pending = ('cancel', comp)
+        else:
+            self.pending = ('noconv', comp)
+
+        # Przejscie do kolejnego detalu poza kontekstem obslugi polecenia.
+        try:
+            self.app.fireCustomEvent(NEXT_EVENT_ID)
+        except Exception:
+            self.pump()
+
+
+class _CommandTerminatedHandler(adsk.core.ApplicationCommandEventHandler):
+    def __init__(self, wizard):
+        super(_CommandTerminatedHandler, self).__init__()
+        self.wizard = wizard
+
+    def notify(self, args):
+        try:
+            self.wizard.on_command_terminated(args)
+        except Exception:
+            try:
+                self.wizard.logger.log('Blad w commandTerminated:\n' + traceback.format_exc())
+            except Exception:
+                pass
+
+
+class _NextPartHandler(adsk.core.CustomEventHandler):
+    def __init__(self, wizard):
+        super(_NextPartHandler, self).__init__()
+        self.wizard = wizard
+
+    def notify(self, args):
+        try:
+            self.wizard.pump()
+        except Exception:
+            try:
+                self.wizard.logger.log('Blad w pump:\n' + traceback.format_exc())
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------------------
 # Punkt wejscia
 # ----------------------------------------------------------------------------
 def run(context):
+    global _wizard
     app = adsk.core.Application.get()
     ui = app.userInterface
     logger = None
@@ -464,7 +658,7 @@ def run(context):
         log_path = os.path.join(out_folder, 'rozwijanie_blach_{}.log'.format(stamp))
         logger = Logger(log_path, app)
 
-        logger.log('=== START: automatyczne rozwijanie blach ===')
+        logger.log('=== START: rozwijanie blach (kreator pol-automatyczny) ===')
         try:
             doc_name = design.parentDocument.name
         except Exception:
@@ -474,49 +668,21 @@ def run(context):
 
         if design.designType == adsk.fusion.DesignTypes.DirectDesignType:
             logger.log('[UWAGA] Projekt w trybie bezposrednim (Direct). Wzory plaskie '
-                       'blach gietych wymagaja trybu parametrycznego. Wlacz historie '
-                       'projektu, jesli element jest blacha gieta.')
+                       'wymagaja trybu parametrycznego (wlacz historie projektu).')
 
         components = gather_unique_components(root_comp, logger)
+        queue = [{'comp': d['comp'], 'count': d['count']} for d in components.values()]
+        if not queue:
+            logger.log('Brak komponentow do przetworzenia.')
+            ui.messageBox('Brak komponentow do przetworzenia.')
+            logger.close()
+            return
 
-        n_ok = n_skip = n_fail = n_conv = 0
-        convert_names = []
-        for data in components.values():
-            comp = data['comp']
-            count = data['count']
-            logger.log('--- Komponent: {} (wystapien: {}) ---'.format(comp.name, count))
-            result = process_component(app, ui, comp, count, out_folder, design, logger)
-            if result == 'ok':
-                n_ok += 1
-            elif result == 'convert':
-                n_conv += 1
-                convert_names.append(comp.name)
-            elif result == 'skip':
-                n_skip += 1
-            else:
-                n_fail += 1
-
-        if convert_names:
-            logger.log('--- Kandydaci do recznej konwersji na blache ({}): ---'.format(n_conv))
-            for nm in convert_names:
-                logger.log('    * {}'.format(nm))
-
-        logger.log('=== KONIEC: zapisano {}, do konwersji {}, pominieto {}, '
-                   'bledy {} ==='.format(n_ok, n_conv, n_skip, n_fail))
-
-        summary = ('Zakonczono.\n\n'
-                   'Zapisane DXF: {}\n'
-                   'Do recznej konwersji na blache: {}\n'
-                   'Pominiete: {}\n'
-                   'Bledy: {}\n\n'
-                   'Log: {}').format(n_ok, n_conv, n_skip, n_fail, log_path)
-        if convert_names:
-            preview = '\n'.join('  - ' + nm for nm in convert_names[:12])
-            if n_conv > 12:
-                preview += '\n  - ... (+{} wiecej, szczegoly w logu)'.format(n_conv - 12)
-            summary += ('\n\nElementy do konwersji "Convert to Sheet Metal" '
-                        '(potem uruchom skrypt ponownie):\n' + preview)
-        ui.messageBox(summary)
+        del _handlers[:]
+        _wizard = Wizard(app, ui, design, out_folder, logger, queue, log_path)
+        _wizard.start()
+        # run() konczy sie tutaj; kreator dziala dalej dzieki autoTerminate(False)
+        # i zostanie zamkniety przez adsk.terminate() w Wizard.finish().
 
     except Exception:
         msg = 'Blad wykonania skryptu:\n{}'.format(traceback.format_exc())
@@ -524,6 +690,3 @@ def run(context):
             logger.log(msg)
         if ui:
             ui.messageBox(msg)
-    finally:
-        if logger:
-            logger.close()
