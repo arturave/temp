@@ -1,0 +1,12 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "",
+    "description": {
+        "": "Rozklada zlozenie na poszczegolne elementy i zapisuje kazdy jako osobny plik STEP z iloscia sztuk w nazwie"
+    },
+    "version": "1.0.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
