@@ -58,6 +58,54 @@ def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*\r\n\t]', '_', name).strip()
 
 
+def format_thickness_mm(mm):
+    return '{:.1f}'.format(mm).replace('.', ',')
+
+
+def build_filename(detail_name, body_name, thickness_mm, count):
+    """Maska: NazwaDetalu_NazwaBryly_#X,Xmm_ZZZszt.step."""
+    return '{}_{}_#{}mm_{:03d}szt.step'.format(
+        sanitize_filename(detail_name), sanitize_filename(body_name),
+        format_thickness_mm(thickness_mm), count)
+
+
+def largest_planar_face(body):
+    best = None
+    best_area = -1.0
+    for f in body.faces:
+        if isinstance(f.geometry, adsk.core.Plane) and f.area > best_area:
+            best = f
+            best_area = f.area
+    return best
+
+
+def body_thickness_mm(body):
+    """Grubosc materialu w mm: najmniejsza odleglosc miedzy najwieksza plaska
+    sciana a rownolegla scianka po drugiej stronie (niezmiennik orientacji).
+    Fallback: najmniejszy wymiar bryly z bounding box."""
+    f1 = largest_planar_face(body)
+    gap_cm = None
+    if f1 is not None:
+        n1 = f1.geometry.normal
+        o1 = f1.geometry.origin
+        for f in body.faces:
+            if f is f1 or not isinstance(f.geometry, adsk.core.Plane):
+                continue
+            if abs(n1.dotProduct(f.geometry.normal)) < 0.999:
+                continue
+            o2 = f.geometry.origin
+            v = adsk.core.Vector3D.create(o2.x - o1.x, o2.y - o1.y, o2.z - o1.z)
+            gap = abs(v.dotProduct(n1))
+            if gap > 1e-4 and (gap_cm is None or gap < gap_cm):
+                gap_cm = gap
+    if gap_cm is None:
+        bb = body.boundingBox
+        gap_cm = min(bb.maxPoint.x - bb.minPoint.x,
+                     bb.maxPoint.y - bb.minPoint.y,
+                     bb.maxPoint.z - bb.minPoint.z)
+    return round(gap_cm * 10.0, 1)
+
+
 def body_signature(body):
     """Niezmiennik ksztaltu odporny na obrot i przesuniecie."""
     return (round(body.volume, 4), round(body.area, 4),
@@ -105,13 +153,14 @@ def unique_path(folder, filename):
         i += 1
 
 
-def export_body_step(export_mgr, root_comp, group, out_folder, logger):
+def export_body_step(export_mgr, root_comp, detail_name, group, out_folder, logger):
     """Eksportuje reprezentanta grupy do STEP. Zwraca 'ok'|'fail'.
     STEP eksportuje KOMPONENT, nie pojedyncza bryle - dlatego kopiujemy bryle do
     tymczasowego komponentu, eksportujemy go i usuwamy."""
     body = group['rep']
     count = group['count']
-    filename = '{}_{:03d}szt.step'.format(sanitize_filename(body.name), count)
+    thickness_mm = body_thickness_mm(body)
+    filename = build_filename(detail_name, body.name, thickness_mm, count)
     filepath = unique_path(out_folder, filename)
 
     temp_occ = None
@@ -138,8 +187,8 @@ def export_body_step(export_mgr, root_comp, group, out_folder, logger):
         extra = ''
         if count > 1:
             extra = '  [identyczne: {}]'.format(', '.join(group['members']))
-        logger.log('[STEP] {}: zapisano "{}" ({} szt.){}'.format(
-            body.name, os.path.basename(filepath), count, extra))
+        logger.log('[STEP] {}: zapisano "{}" (grubosc {} mm, {} szt.){}'.format(
+            body.name, os.path.basename(filepath), format_thickness_mm(thickness_mm), count, extra))
         return 'ok'
     logger.log('[BLAD] {}: eksport nieudany.'.format(body.name))
     return 'fail'
@@ -183,10 +232,11 @@ def run(context):
 
         groups = gather_unique_bodies(root_comp, GROUP_IDENTICAL_BODIES, logger)
         export_mgr = design.exportManager
+        detail_name = root_comp.name
 
         n_ok = n_fail = 0
         for g in groups:
-            res = export_body_step(export_mgr, root_comp, g, out_folder, logger)
+            res = export_body_step(export_mgr, root_comp, detail_name, g, out_folder, logger)
             if res == 'ok':
                 n_ok += 1
             else:
