@@ -395,6 +395,7 @@ class Wizard(object):
         self.pending = None          # wynik ostatniego okna konwersji do rozliczenia
         self.waiting = False         # czy czekamy na zamkniecie okna konwersji
         self.waiting_comp = None
+        self.waiting_count = 0
         self.n_ok = 0
         self.n_skip = 0
         self.n_fail = 0
@@ -490,7 +491,7 @@ class Wizard(object):
 
             cand_mm = looks_like_sheet_candidate(body)
             if cand_mm is not None:
-                if self._open_convert_dialog(comp, occ, body, cand_mm):
+                if self._open_convert_dialog(comp, occ, body, cand_mm, count):
                     return  # czekamy na zamkniecie okna (commandTerminated)
                 self.idx += 1
                 continue
@@ -503,26 +504,27 @@ class Wizard(object):
         self.finish()
 
     def _resolve_pending(self):
+        # Wywolywane z kolejki zdarzen (po tiku), gdy model po konwersji jest juz
+        # przeliczony - dlatego dopiero tu weryfikujemy isSheetMetal.
         kind = self.pending[0]
         comp = self.pending[1]
-        if kind == 'export':
+        if kind == 'check':
             count = self.pending[2]
             body = largest_solid_body(comp)
-            if body is not None:
+            if body is not None and body_is_sheet_metal(body):
+                self.logger.log('[OK] {}: skonwertowano na blache (grubosc wykryta przez Fusion).'.format(comp.name))
                 self._unfold_and_export(comp, body, count)
             else:
-                self.logger.log('[BLAD] {}: brak bryly po konwersji.'.format(comp.name))
-                self.n_fail += 1
+                self.logger.log('[POMIN] {}: po zamknieciu okna bryla nie jest blacha '
+                                '(konwersja nieudana lub niemozliwa).'.format(comp.name))
+                self.n_skip += 1
         elif kind == 'cancel':
             self.logger.log('[ANULOWANO] {}: wcisnieto Anuluj - pomijam kolejne kroki.'.format(comp.name))
             self.n_cancel += 1
             self.cancelled.append(comp.name)
-        else:  # 'noconv'
-            self.logger.log('[POMIN] {}: po zamknieciu okna bryla nie jest blacha.'.format(comp.name))
-            self.n_skip += 1
 
     # -- akcje na detalu -----------------------------------------------------
-    def _open_convert_dialog(self, comp, occ, body, cand_mm):
+    def _open_convert_dialog(self, comp, occ, body, cand_mm, count):
         """Zaznacza sciane i otwiera okno 'Convert to Sheet Metal'. Zwraca True,
         jesli okno otwarto (czekamy na jego zamkniecie)."""
         face = largest_planar_face(body)
@@ -559,6 +561,7 @@ class Wizard(object):
 
         self.waiting = True
         self.waiting_comp = comp
+        self.waiting_count = count
         self.logger.log('[KONWERSJA] {}: otwarto okno "Convert to Sheet Metal" '
                         '(wstepnie ~{} mm). Zatwierdz (OK) albo Anuluj.'.format(
                             comp.name, format_thickness_mm(cand_mm)))
@@ -616,6 +619,7 @@ class Wizard(object):
             return
 
         comp = self.waiting_comp
+        count = self.waiting_count
         self.waiting = False
         self.waiting_comp = None
         try:
@@ -629,15 +633,12 @@ class Wizard(object):
         except Exception:
             completed = False
 
-        body = largest_solid_body(comp)
-        count = self.queue[self.idx]['count']
-        if completed and body is not None and body_is_sheet_metal(body):
-            self.logger.log('[OK] {}: skonwertowano na blache (grubosc wykryta przez Fusion).'.format(comp.name))
-            self.pending = ('export', comp, count)
-        elif not completed:
-            self.pending = ('cancel', comp)
+        # Tylko klasyfikujemy OK vs Anuluj. Weryfikacja isSheetMetal i rozwiniecie
+        # nastepuja w _resolve_pending (po tiku), gdy model jest juz przeliczony.
+        if completed:
+            self.pending = ('check', comp, count)
         else:
-            self.pending = ('noconv', comp)
+            self.pending = ('cancel', comp)
 
         # Przejscie do kolejnego detalu poza kontekstem obslugi polecenia.
         try:
