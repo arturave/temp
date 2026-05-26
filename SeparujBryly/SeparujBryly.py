@@ -105,18 +105,35 @@ def unique_path(folder, filename):
         i += 1
 
 
-def export_body_step(export_mgr, group, out_folder, logger):
-    """Eksportuje reprezentanta grupy do STEP. Zwraca 'ok'|'fail'."""
+def export_body_step(export_mgr, root_comp, group, out_folder, logger):
+    """Eksportuje reprezentanta grupy do STEP. Zwraca 'ok'|'fail'.
+    STEP eksportuje KOMPONENT, nie pojedyncza bryle - dlatego kopiujemy bryle do
+    tymczasowego komponentu, eksportujemy go i usuwamy."""
     body = group['rep']
     count = group['count']
     filename = '{}_{:03d}szt.step'.format(sanitize_filename(body.name), count)
     filepath = unique_path(out_folder, filename)
+
+    temp_occ = None
+    ok = False
     try:
-        opts = export_mgr.createSTEPExportOptions(filepath, body)
+        temp_occ = root_comp.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+        try:
+            temp_occ.component.name = sanitize_filename(body.name)
+        except Exception:
+            pass
+        body.copyToComponent(temp_occ)
+        opts = export_mgr.createSTEPExportOptions(filepath, temp_occ.component)
         ok = export_mgr.execute(opts)
     except Exception as e:
         logger.log('[BLAD] {}: eksport STEP nieudany ({}).'.format(body.name, e))
-        return 'fail'
+    finally:
+        if temp_occ is not None:
+            try:
+                temp_occ.deleteMe()
+            except Exception:
+                pass
+
     if ok:
         extra = ''
         if count > 1:
@@ -124,7 +141,7 @@ def export_body_step(export_mgr, group, out_folder, logger):
         logger.log('[STEP] {}: zapisano "{}" ({} szt.){}'.format(
             body.name, os.path.basename(filepath), count, extra))
         return 'ok'
-    logger.log('[BLAD] {}: execute() zwrocilo False.'.format(body.name))
+    logger.log('[BLAD] {}: eksport nieudany.'.format(body.name))
     return 'fail'
 
 
@@ -169,7 +186,7 @@ def run(context):
 
         n_ok = n_fail = 0
         for g in groups:
-            res = export_body_step(export_mgr, g, out_folder, logger)
+            res = export_body_step(export_mgr, root_comp, g, out_folder, logger)
             if res == 'ok':
                 n_ok += 1
             else:
